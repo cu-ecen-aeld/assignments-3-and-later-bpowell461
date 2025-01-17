@@ -14,12 +14,31 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/signal.h>
+#include <pthread.h>
+#include <sys/queue.h>
+#include <time.h>
+#include <sys/time.h>
 
 #define BUF_SIZE 256
 
-const char*         socket_file = "/var/tmp/aesdsocketdata";
-int                 sock_fd;
-struct addrinfo     *provider;
+typedef struct _threadHandle_t
+{
+    int fd;
+    pthread_t thread;
+} threadHandle_t;
+
+typedef struct _threadList_t
+{
+    threadHandle_t *thread;
+    SLIST_ENTRY(_threadList_t) entries;
+} threadList_t;
+
+const char*             socket_file = "/var/tmp/aesdsocketdata";
+int                     sock_fd;
+struct addrinfo         *provider;
+static pthread_mutex_t  mutex;
+static SLIST_HEAD(slisthead, _threadList_t) head = SLIST_HEAD_INITIALIZER(head);
+static volatile sig_atomic_t exit_flag = 0;
 
 // Function Prototypes
 void daemon(void);
@@ -27,6 +46,8 @@ void signal_handler(int sig);
 int  receive_data(int fd);
 int  send_data(int fd);
 void cleanup(void);
+void* handle_connection(void* arg);
+void* timestamp_thread(void* arg);
 
 int main(int argc, char **argv)
 {
@@ -37,9 +58,17 @@ int main(int argc, char **argv)
     struct sockaddr_in  *ipv4                   = NULL;
     char                ipstr[INET_ADDRSTRLEN]  = {0};
     int                 sock_in_fd              = 0;
+    pthread_t           ts_thread;
 
     // Setting up the syslog
     openlog(NULL,0,LOG_USER);
+
+    // Creating mutex
+    if (pthread_mutex_init(&mutex, NULL) != 0)
+    {
+        syslog(LOG_ERR, "**ERROR pthread_mutex_init: %s\n", strerror(errno));
+        exit(-1);
+    }
 
     sa.sa_handler = &signal_handler;
     sigemptyset(&sa.sa_mask);
@@ -61,71 +90,143 @@ int main(int argc, char **argv)
         exit(-1);
     }
 
-    // Creating the socket and binding
-    ipv4 = (struct sockaddr_in *)provider->ai_addr;
-    inet_ntop(provider->ai_family, &(ipv4->sin_addr), ipstr, sizeof ipstr);
+    // Creating socket
     sock_fd = socket(provider->ai_family, provider->ai_socktype, provider->ai_protocol);
-    if (sock_fd == -1) {
-        syslog(LOG_ERR,"**ERROR socket: %s\n", strerror(errno));
-        exit(-1);
-    }
-
-    int flags = 1;
-    if (setsockopt(sock_fd,SOL_SOCKET,SO_REUSEADDR, &flags, sizeof(flags)) == -1) {
-        syslog(LOG_ERR, "**ERROR setsockopt: %s\n", strerror(errno));
-        exit(-1);
-    }
-
-    if (bind(sock_fd, provider->ai_addr, provider->ai_addrlen) == -1) {
-        syslog(LOG_ERR,"**ERROR bind: %s\n", strerror(errno));
-        exit(-1);
-    }
-
-    // Fork the process to run as a daemon
-    if (argc > 1 && strcmp(argv[1], "-d") == 0)
+    if (sock_fd == -1)
     {
-        daemon();
-    }
-
-    // Listening on the socket
-    if (listen(sock_fd, 5) == -1) {
-        syslog(LOG_ERR,"**ERROR listen: %s\n", strerror(errno));
+        syslog(LOG_ERR, "**ERROR socket: %s\n", strerror(errno));
         exit(-1);
     }
 
-    while (1)
-    {   
-        // Accepting the connection
-        sock_in_fd = accept(sock_fd, provider->ai_addr, &provider->ai_addrlen);
-        if (sock_in_fd == -1) {
-            syslog(LOG_ERR,"**ERROR accept: %s\n", strerror(errno));
-            exit(-1);
-        }
-
-        ipv4 = (struct sockaddr_in *)provider->ai_addr;
-        inet_ntop(provider->ai_family, &(ipv4->sin_addr), ipstr, sizeof ipstr);
-        syslog(LOG_ERR,"Accepted connection from %s\n", ipstr);
-        
-        // Everything went well, let's create a file to store the data
-        if (receive_data(sock_in_fd) != 0)
-        {
-            cleanup();
-            exit(-1);
-        }
-
-        // Send the data back to the client
-        if (send_data(sock_in_fd) != 0)
-        {
-            cleanup();
-            exit(-1);
-        }
-
-        syslog(LOG_INFO, "Closed connection from %s\n", ipstr);
+    // Binding socket
+    if (bind(sock_fd, provider->ai_addr, provider->ai_addrlen) == -1)
+    {
+        syslog(LOG_ERR, "**ERROR bind: %s\n", strerror(errno));
+        exit(-1);
     }
 
+    // Listening on socket
+    if (listen(sock_fd, 10) == -1)
+    {
+        syslog(LOG_ERR, "**ERROR listen: %s\n", strerror(errno));
+        exit(-1);
+    }
+
+    // Creating timestamp thread
+    if (pthread_create(&ts_thread, NULL, timestamp_thread, NULL) != 0)
+    {
+        syslog(LOG_ERR, "**ERROR pthread_create: %s\n", strerror(errno));
+        exit(-1);
+    }
+
+    while (!exit_flag)
+    {
+        sock_in_fd = accept(sock_fd, NULL, NULL);
+        if (sock_in_fd == -1)
+        {
+            if (exit_flag) break;
+            syslog(LOG_ERR, "**ERROR accept: %s\n", strerror(errno));
+            continue;
+        }
+
+        threadHandle_t *thread_handle = malloc(sizeof(threadHandle_t));
+        if (!thread_handle)
+        {
+            syslog(LOG_ERR, "**ERROR malloc: %s\n", strerror(errno));
+            close(sock_in_fd);
+            continue;
+        }
+
+        thread_handle->fd = sock_in_fd;
+        if (pthread_create(&thread_handle->thread, NULL, handle_connection, thread_handle) != 0)
+        {
+            syslog(LOG_ERR, "**ERROR pthread_create: %s\n", strerror(errno));
+            close(sock_in_fd);
+            free(thread_handle);
+            continue;
+        }
+
+        threadList_t *thread_list = malloc(sizeof(threadList_t));
+        if (!thread_list)
+        {
+            syslog(LOG_ERR, "**ERROR malloc: %s\n", strerror(errno));
+            close(sock_in_fd);
+            free(thread_handle);
+            continue;
+        }
+
+        thread_list->thread = thread_handle;
+        SLIST_INSERT_HEAD(&head, thread_list, entries);
+    }
+
+    // Cleanup
+    cleanup();
     return 0;
 }
 
+void* handle_connection(void* arg)
+{
+    threadHandle_t *thread_handle = (threadHandle_t*)arg;
+    int fd = thread_handle->fd;
+
+    while (1)
+    {
+        if (receive_data(fd) <= 0) break;
+        if (send_data(fd) <= 0) break;
+    }
+
+    close(fd);
+    free(thread_handle);
+    pthread_exit(NULL);
+}
+
+void* timestamp_thread(void* arg)
+{
+    (void)arg;
+    while (!exit_flag)
+    {
+        sleep(10);
+        pthread_mutex_lock(&mutex);
+        FILE *file = fopen(socket_file, "a");
+        if (file)
+        {
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            char buffer[64];
+            strftime(buffer, sizeof(buffer), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
+            fputs(buffer, file);
+            fclose(file);
+        }
+        pthread_mutex_unlock(&mutex);
+    }
+    pthread_exit(NULL);
+}
+
+void signal_handler(int sig)
+{
+    if (sig == SIGINT || sig == SIGTERM)
+    {
+        exit_flag = 1;
+        close(sock_fd);
+    }
+}
+
+void cleanup(void)
+{
+    threadList_t *thread_list;
+    while (!SLIST_EMPTY(&head))
+    {
+        thread_list = SLIST_FIRST(&head);
+        pthread_join(thread_list->thread->thread, NULL);
+        SLIST_REMOVE_HEAD(&head, entries);
+        free(thread_list->thread);
+        free(thread_list);
+    }
+    pthread_mutex_destroy(&mutex);
+    closelog();
+}
+
+// Implement receive_data and send_data functions
 int receive_data(int fd)
 {
     unsigned char buf[BUF_SIZE] = {0};
@@ -173,21 +274,6 @@ int send_data(int fd)
     return 0;
 }
 
-void signal_handler(int sig)
-{
-    if (sig == SIGTERM || sig == SIGINT)
-    {
-        syslog(LOG_INFO, "Caught signal, exiting\n");
-        close(sock_fd);
-        freeaddrinfo(provider);
-        if (remove(socket_file) != 0)
-            syslog(LOG_ERR, "**ERROR remove: %s\n", strerror(errno));
-
-        cleanup();
-        exit(0);
-    }
-}
-
 void daemon(void)
 {
     pid_t pid = fork();
@@ -219,11 +305,4 @@ void daemon(void)
     {
         exit(0);
     }
-}
-
-void cleanup(void)
-{
-    close(sock_fd);
-    freeaddrinfo(provider);
-    closelog();
 }
