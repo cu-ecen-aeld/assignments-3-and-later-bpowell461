@@ -1,10 +1,11 @@
 #!/bin/sh
 SOCKET_PATH=/usr/bin/aesdsocket
 
-start-stop-daemon --status --name aesdsocket
-ret=$?
-if [ $ret -ne 0 ]; then
-    start-stop-daemon --name aesdsocket --start --startas $SOCKET_PATH -- -d
+if [ "$1" = "start" ]; then
+    start-stop-daemon --start -n aesdsocket --exec $SOCKET_PATH -- -d
+elif [ "$1" = "stop" ]; then
+    start-stop-daemon -K -n aesdsocket
 else
-    start-stop-daemon --stop --signal TERM --name aesdsocket
+    echo "Usage: $0 start|stop" >&2
+    exit 3
 fi
