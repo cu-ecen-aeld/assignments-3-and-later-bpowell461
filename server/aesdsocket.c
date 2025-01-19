@@ -24,12 +24,12 @@
 typedef struct _thread_data_t {
     pthread_t thread_id;
     int thread_fd;
-    struct addrinfo *provider;
+    char ipstr[INET_ADDRSTRLEN];
     bool exit_thread;
 } thread_data_t;
 
 struct queue_t {
-    thread_data_t *data;
+    thread_data_t data;
     SLIST_ENTRY(queue_t) entries;
 };
 
@@ -68,6 +68,7 @@ int main(int argc, char **argv)
     // Registering signals
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGPIPE, &sa, NULL);
 
     // Setting up the network interface
     netif.ai_family = AF_INET;
@@ -113,10 +114,10 @@ int main(int argc, char **argv)
 
     // Creating a thread to handle the connection
     struct queue_t *timeElm = malloc(sizeof(struct queue_t));
-    thread_data_t *timeData = malloc(sizeof(thread_data_t));
-    timeData->exit_thread = false;
+    memset(timeElm, 0, sizeof(struct queue_t));
+    timeElm->data.exit_thread = false;
 
-    pthread_create(&timeData->thread_id, NULL, timerFunction, timeData);
+    pthread_create(&timeElm->data.thread_id, NULL, timerFunction, &timeElm->data);
 
     SLIST_INSERT_HEAD(&head, timeElm, entries);
 
@@ -131,11 +132,13 @@ int main(int argc, char **argv)
 
         // Creating a thread to handle the connection
         struct queue_t *elm = malloc(sizeof(struct queue_t));
-        thread_data_t *data = malloc(sizeof(thread_data_t));
-        data->thread_fd = sock_in_fd;
-        data->provider = provider;
+        memset(elm, 0, sizeof(struct queue_t));
+        elm->data.thread_fd = sock_in_fd;
 
-        pthread_create(&data->thread_id, NULL, threadFunction, data);
+        struct sockaddr_in *ipv4 = (struct sockaddr_in *)provider->ai_addr;
+        inet_ntop(provider->ai_family, &(ipv4->sin_addr), elm->data.ipstr, sizeof elm->data.ipstr);
+
+        pthread_create(&elm->data.thread_id, NULL, threadFunction, &elm->data);
 
         SLIST_INSERT_HEAD(&head, elm, entries);
     }
@@ -147,12 +150,8 @@ void *threadFunction(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
     int fd = data->thread_fd;
-    struct addrinfo *provider = data->provider;
-    char ipstr[INET_ADDRSTRLEN];
-    struct sockaddr_in *ipv4 = (struct sockaddr_in *)provider->ai_addr;
-    inet_ntop(provider->ai_family, &(ipv4->sin_addr), ipstr, sizeof ipstr);
 
-    syslog(LOG_INFO, "Accepted connection from %s\n", ipstr);
+    syslog(LOG_INFO, "Accepted connection from %s\n", data->ipstr);
 
     pthread_mutex_lock(&mutex);
 
@@ -168,7 +167,7 @@ void *threadFunction(void *arg)
         data->exit_thread = true;
     }
 
-    syslog(LOG_INFO, "Closed connection from %s\n", ipstr);
+    syslog(LOG_INFO, "Closed connection from %s\n", data->ipstr);
     close(fd);
     return NULL;
 }
@@ -265,8 +264,7 @@ void signal_handler(int sig)
     {
         syslog(LOG_INFO, "Caught signal, exiting\n");
         cleanup();
-        if (remove(socket_file) != 0)
-            syslog(LOG_ERR, "**ERROR remove: %s\n", strerror(errno));
+        remove(socket_file);
         exit(0);
     }
 }
@@ -312,17 +310,20 @@ void cleanup(void)
     while (!SLIST_EMPTY(&head))
     {
         struct queue_t *entry = SLIST_FIRST(&head);
-        entry->data->exit_thread = true;
-        pthread_join(entry->data->thread_id, NULL);
+        entry->data.exit_thread = true;
+        pthread_join(entry->data.thread_id, NULL);
         
         SLIST_REMOVE_HEAD(&head, entries);
 
-        if (entry->data != NULL)
-            free(entry->data);
-
         if (entry != NULL)
             free(entry);
+
+        entry = NULL;
     }
+
+    if (provider != NULL)
+        freeaddrinfo(provider);
+
     close(sock_fd);
     closelog();
 }
