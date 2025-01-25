@@ -16,9 +16,10 @@
 #include <sys/signal.h>
 #include <sys/queue.h>
 #include <pthread.h>
+#include <time.h>
 
 // Macros
-#define BUF_SIZE 256
+#define BUF_SIZE 4096
 
 // Type Definitions
 typedef struct _thread_data_t {
@@ -38,6 +39,7 @@ static SLIST_HEAD(queue_head, queue_t) head = SLIST_HEAD_INITIALIZER(head);
 static int sock_fd;
 static struct addrinfo *provider;
 const char* socket_file = "/var/tmp/aesdsocketdata";
+static sig_atomic_t exitProgram = false;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Function Prototypes
@@ -58,6 +60,7 @@ int main(int argc, char **argv)
 
     // Setting up the syslog
     openlog(NULL,0,LOG_USER);
+    syslog(LOG_INFO, "Starting socket server\n");
 
     SLIST_INIT(&head);
 
@@ -121,7 +124,7 @@ int main(int argc, char **argv)
 
     SLIST_INSERT_HEAD(&head, timeElm, entries);
 
-    while (1)
+    while (!exitProgram)
     {   
         // Accepting the connection
         int sock_in_fd = accept(sock_fd, provider->ai_addr, &provider->ai_addrlen);
@@ -141,7 +144,10 @@ int main(int argc, char **argv)
         pthread_create(&elm->data.thread_id, NULL, threadFunction, &elm->data);
 
         SLIST_INSERT_HEAD(&head, elm, entries);
+        nanosleep((const struct timespec[]){{0, 1000000L}}, NULL);
     }
+
+    cleanup();
 
     return 0;
 }
@@ -153,20 +159,24 @@ void *threadFunction(void *arg)
 
     syslog(LOG_INFO, "Accepted connection from %s\n", data->ipstr);
 
-    pthread_mutex_lock(&mutex);
-
-    if (receive_data(fd) != 0)
+    
+    while (!data->exit_thread && !exitProgram)
     {
-        data->exit_thread = true;
+        pthread_mutex_lock(&mutex);
+        if (receive_data(fd) != 0)
+        {
+            data->exit_thread = true;
+        }
+
+        if (send_data(fd) != 0)
+        {
+            data->exit_thread = true;
+        }
+        pthread_mutex_unlock(&mutex);
+        nanosleep((const struct timespec[]){{0, 1000000L}}, NULL);
     }
 
-    pthread_mutex_unlock(&mutex);
-
-    if (send_data(fd) != 0)
-    {
-        data->exit_thread = true;
-    }
-
+    data->exit_thread = true;
     syslog(LOG_INFO, "Closed connection from %s\n", data->ipstr);
     close(fd);
     return NULL;
@@ -176,7 +186,7 @@ void *timerFunction(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
     time_t last_print = time(NULL);
-    while (!data->exit_thread) 
+    while (!data->exit_thread && !exitProgram) 
     {
         time_t now = time(NULL);
 
@@ -205,6 +215,7 @@ void *timerFunction(void *arg)
         last_print = now;
 
         pthread_mutex_unlock(&mutex);
+        nanosleep((const struct timespec[]){{0, 1000000L}}, NULL);
     }
 
     return NULL;
@@ -263,9 +274,7 @@ void signal_handler(int sig)
     if (sig == SIGTERM || sig == SIGINT)
     {
         syslog(LOG_INFO, "Caught signal, exiting\n");
-        cleanup();
-        remove(socket_file);
-        exit(0);
+        exitProgram = true;
     }
 }
 
@@ -324,6 +333,8 @@ void cleanup(void)
     if (provider != NULL)
         freeaddrinfo(provider);
 
+    remove(socket_file);
+    shutdown(sock_fd, SHUT_RDWR);
     close(sock_fd);
     closelog();
 }
