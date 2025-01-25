@@ -1,13 +1,22 @@
-#!/bin/sh
-SOCKET_PATH=/usr/bin/aesdsocket
+#! /bin/sh
 
-if [ "$1" = "start" ]; then
-    echo "Starting aesdsocket daemon"
-    start-stop-daemon --start -n aesdsocket --exec $SOCKET_PATH -- -d
-elif [ "$1" = "stop" ]; then
-    echo "Stopping aesdsocket daemon"
-    start-stop-daemon -K -n aesdsocket
-else
-    echo "Usage: $0 start|stop" >&2
-    exit 3
+if [ -z "$1" ]; then
+    echo "usage: $0 {start|stop}"
+    exit 1
 fi
+
+case "$1" in
+    start)
+        echo "Starting aesdsocketserver"
+        start-stop-daemon -S -n aesdsocket -a /usr/bin/aesdsocket -- -d
+        ;;
+    stop)
+        echo "Stopping aesdsocketserver"
+        start-stop-daemon -K -n aesdsocket
+        ;;
+    *)
+        echo "usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+exit 0

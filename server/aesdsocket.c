@@ -29,6 +29,13 @@ typedef struct _thread_data_t {
     bool exit_thread;
 } thread_data_t;
 
+typedef enum {
+    STATE_RECEIVE = 0,
+    STATE_SEND,
+    STATE_EXIT,
+    STATE_COUNT
+}thread_state_t;
+
 struct queue_t {
     thread_data_t data;
     SLIST_ENTRY(queue_t) entries;
@@ -40,7 +47,10 @@ static int sock_fd;
 static struct addrinfo *provider;
 const char* socket_file = "/var/tmp/aesdsocketdata";
 static sig_atomic_t exitProgram = false;
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static int outfile_fd;
+
+pthread_mutex_t fileMtx = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t threadMtx = PTHREAD_MUTEX_INITIALIZER;
 
 // Function Prototypes
 void daemon(void);
@@ -66,7 +76,7 @@ int main(int argc, char **argv)
 
     sa.sa_handler = &signal_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
+    sa.sa_flags = 0;
 
     // Registering signals
     sigaction(SIGINT, &sa, NULL);
@@ -74,6 +84,7 @@ int main(int argc, char **argv)
     sigaction(SIGPIPE, &sa, NULL);
 
     // Setting up the network interface
+    memset(&netif, 0, sizeof(netif));
     netif.ai_family = AF_INET;
     netif.ai_socktype = SOCK_STREAM;
     netif.ai_flags = AI_PASSIVE;
@@ -110,9 +121,16 @@ int main(int argc, char **argv)
     }
 
     // Listening on the socket
-    if (listen(sock_fd, 10) == -1) {
+    if (listen(sock_fd, 20) == -1) {
         syslog(LOG_ERR,"**ERROR listen: %s\n", strerror(errno));
         exit(-1);
+    }
+
+    outfile_fd = open(socket_file, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (outfile_fd < 0) {
+        syslog(LOG_ERR, "**ERROR open: %s\n", strerror(errno));
+        close(outfile_fd);
+        return -1;
     }
 
     // Creating a thread to handle the connection
@@ -122,8 +140,9 @@ int main(int argc, char **argv)
 
     pthread_create(&timeElm->data.thread_id, NULL, timerFunction, &timeElm->data);
 
+    pthread_mutex_lock(&threadMtx);
     SLIST_INSERT_HEAD(&head, timeElm, entries);
-
+    pthread_mutex_unlock(&threadMtx);
     while (!exitProgram)
     {   
         // Accepting the connection
@@ -141,10 +160,17 @@ int main(int argc, char **argv)
         struct sockaddr_in *ipv4 = (struct sockaddr_in *)provider->ai_addr;
         inet_ntop(provider->ai_family, &(ipv4->sin_addr), elm->data.ipstr, sizeof elm->data.ipstr);
 
-        pthread_create(&elm->data.thread_id, NULL, threadFunction, &elm->data);
+        if (pthread_create(&elm->data.thread_id, NULL, threadFunction, &elm->data) != 0)
+        {
+            syslog(LOG_ERR, "**ERROR pthread_create: %s\n", strerror(errno));
+            free(elm);
+            close(sock_in_fd);
+            continue;
+        }
 
+        pthread_mutex_lock(&threadMtx);
         SLIST_INSERT_HEAD(&head, elm, entries);
-        nanosleep((const struct timespec[]){{0, 1000000L}}, NULL);
+        pthread_mutex_unlock(&threadMtx);
     }
 
     cleanup();
@@ -156,66 +182,53 @@ void *threadFunction(void *arg)
 {
     thread_data_t *data = (thread_data_t *)arg;
     int fd = data->thread_fd;
+    thread_state_t state = STATE_RECEIVE;
 
     syslog(LOG_INFO, "Accepted connection from %s\n", data->ipstr);
 
-    
-    while (!data->exit_thread && !exitProgram)
+    while(!data->exit_thread)
     {
-        pthread_mutex_lock(&mutex);
-        if (receive_data(fd) != 0)
+        if (exitProgram)
         {
-            data->exit_thread = true;
+            state = STATE_EXIT;
+            break;
         }
 
-        if (send_data(fd) != 0)
+        switch(state)
         {
-            data->exit_thread = true;
+            case STATE_RECEIVE:
+                state = receive_data(fd) == 0 ? STATE_SEND : STATE_EXIT;
+                break;
+            case STATE_SEND:
+                // For now lets just exit the thread after sending the data
+                state = send_data(fd) == 0 ? STATE_EXIT : STATE_EXIT;
+                break;
+            case STATE_EXIT:
+                data->exit_thread = true;
+                break;
+            default:
+                break;  
         }
-        pthread_mutex_unlock(&mutex);
-        nanosleep((const struct timespec[]){{0, 1000000L}}, NULL);
     }
 
-    data->exit_thread = true;
     syslog(LOG_INFO, "Closed connection from %s\n", data->ipstr);
     close(fd);
-    return NULL;
+    pthread_exit(NULL);
 }
 
 void *timerFunction(void *arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
-    time_t last_print = time(NULL);
-    while (!data->exit_thread && !exitProgram) 
+    (void) arg;
+    while (!exitProgram) 
     {
+        sleep(10);
         time_t now = time(NULL);
-
-        if (!(difftime(now, last_print) >= 10.0))
-        {
-            continue;
-        }
-
-        pthread_mutex_lock(&mutex);
-
-        now = time(NULL);
         struct tm *tm_info = localtime(&now);
-        char timestamp[BUF_SIZE];
+        char timestamp[100];
         strftime(timestamp, BUF_SIZE, "timestamp: %a, %d %b %Y %T %z\n", tm_info);
-
-        int outfile_fd = open(socket_file, O_CREAT | O_RDWR | O_APPEND, S_IRWXU | S_IRWXG | S_IRWXO, 0644);
-        if (outfile_fd < 0) {
-            syslog(LOG_ERR, "**ERROR open: %s\n", strerror(errno));
-            pthread_mutex_unlock(&mutex);
-            continue;
-        }
-
+        pthread_mutex_lock(&fileMtx);
         write(outfile_fd, timestamp, strlen(timestamp));
-        close(outfile_fd);
-
-        last_print = now;
-
-        pthread_mutex_unlock(&mutex);
-        nanosleep((const struct timespec[]){{0, 1000000L}}, NULL);
+        pthread_mutex_unlock(&fileMtx);
     }
 
     return NULL;
@@ -223,49 +236,45 @@ void *timerFunction(void *arg)
 
 int receive_data(int fd)
 {
-    unsigned char buf[BUF_SIZE] = {0};
-    int outfile_fd = open(socket_file, O_CREAT | O_RDWR | O_APPEND, S_IRWXU | S_IRWXG | S_IRWXO, 0644);
-    if (outfile_fd < 0) {
-        syslog(LOG_ERR, "**ERROR open: %s\n", strerror(errno));
-        close(outfile_fd);
-        return -1;
-    }
+    char* buf = calloc(BUF_SIZE, sizeof(char));
 
     ssize_t recv_bytes;
-    while ((recv_bytes = recv(fd, buf, sizeof(buf)-1, 0)) > 0)
+    ssize_t total_bytes = 0;
+    while ((recv_bytes = recv(fd, buf + total_bytes, BUF_SIZE - total_bytes - 1, 0)) > 0)
     {
-        write(outfile_fd, buf, recv_bytes);
-        if (buf[recv_bytes - 1] == '\n')
+        total_bytes += recv_bytes;
+        buf[total_bytes] = '\0';
+        if (strchr(buf, '\n') != NULL)
             break;
     }
-    lseek(outfile_fd, 0, SEEK_SET);
+    pthread_mutex_lock(&fileMtx);
+    write(outfile_fd, buf, total_bytes);
     fdatasync(outfile_fd);
-    close(outfile_fd);
+    pthread_mutex_unlock(&fileMtx);
+
+    free(buf);
 
     return 0;
 }
 
 int send_data(int fd)
 {
-    unsigned char buf[BUF_SIZE] = {0};
-    int outfile_fd = open(socket_file, O_CREAT | O_RDWR | O_APPEND, S_IRWXU | S_IRWXG | S_IRWXO);
-
-    if (outfile_fd < 0) {
-        syslog(LOG_ERR, "**ERROR open: %s\n", strerror(errno));
-        close(outfile_fd);
-        return -1;
-    }
+    char* buf = malloc(BUF_SIZE);
 
     ssize_t recv_bytes;
+
+    lseek(outfile_fd, 0, SEEK_SET);
+    pthread_mutex_lock(&fileMtx);
     while ((recv_bytes = read(outfile_fd, buf, sizeof(buf)-1)) > 0)
     {
-        if ((send(fd, buf, recv_bytes, 0)) != recv_bytes) {
+        buf[recv_bytes] = '\0';
+        if ((send(fd, buf, recv_bytes, 0)) == -1) {
             syslog(LOG_ERR, "**ERROR send: %s\n", strerror(errno));
-            close(outfile_fd);
-            return -1;
+            break;
         }
     }
-
+    pthread_mutex_unlock(&fileMtx);
+    free(buf);
     return 0;
 }
 
@@ -274,20 +283,25 @@ void signal_handler(int sig)
     if (sig == SIGTERM || sig == SIGINT)
     {
         syslog(LOG_INFO, "Caught signal, exiting\n");
-        exitProgram = true;
     }
+    exitProgram = true;
 }
 
 void daemon(void)
 {
     pid_t pid = fork();
-    if (pid == -1)
+    if (pid < 0)
     {
         syslog(LOG_ERR, "**ERROR fork: %s\n", strerror(errno));
         exit(-1);
     }
-
-    if (pid == 0)
+    else if (pid > 0)
+    {
+        // Parent process
+        syslog(LOG_INFO, "Daemon process started with PID %d\n", pid);
+        exit(0);
+    }
+    else
     {
         // Child process
         setsid();
@@ -305,17 +319,14 @@ void daemon(void)
             syslog(LOG_ERR, "error while redirection STDOUT to /dev/null: %s\n", strerror(errno));
         if(dup2(fd, STDERR_FILENO) == -1)
             syslog(LOG_ERR, "error while redirection STDERR to /dev/null: %s\n", strerror(errno));
-    }
-    else
-    {
-        // Parent process
-        syslog(LOG_INFO, "Daemon process started with PID %d\n", pid);
-        exit(0);
+
+        close(fd);
     }
 }
 
 void cleanup(void)
 {
+    pthread_mutex_lock(&threadMtx);
     while (!SLIST_EMPTY(&head))
     {
         struct queue_t *entry = SLIST_FIRST(&head);
@@ -329,6 +340,7 @@ void cleanup(void)
 
         entry = NULL;
     }
+    pthread_mutex_unlock(&threadMtx);
 
     if (provider != NULL)
         freeaddrinfo(provider);
@@ -336,5 +348,8 @@ void cleanup(void)
     remove(socket_file);
     shutdown(sock_fd, SHUT_RDWR);
     close(sock_fd);
+    close(outfile_fd);
+    pthread_mutex_destroy(&fileMtx);
+    pthread_mutex_destroy(&threadMtx);
     closelog();
 }
