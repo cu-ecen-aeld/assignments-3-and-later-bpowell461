@@ -1,5 +1,5 @@
 NAME = aesdsocket
-CC = gcc
+CC ?= $(CROSS_COMPILE)gcc
 CFLAGS = -Wall -Wextra -g -lc
 SRC = aesdsocket.c
 OBJ = $(SRC:.c=.o)
