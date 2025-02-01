@@ -18,6 +18,12 @@
 #include <pthread.h>
 #include <time.h>
 
+#ifdef USE_AESD_CHAR_DEVICE && USE_AESD_CHAR_DEVICE
+#define SOCKET_FILE "/dev/aesdchar"
+#else
+#define SOCKET_FILE "/var/tmp/aesdsocketdata"
+#endif
+
 // Macros
 #define BUF_SIZE 4096
 
@@ -45,7 +51,7 @@ struct queue_t {
 static SLIST_HEAD(queue_head, queue_t) head = SLIST_HEAD_INITIALIZER(head);
 static int sock_fd;
 static struct addrinfo *provider;
-const char* socket_file = "/var/tmp/aesdsocketdata";
+const char* socket_file = SOCKET_FILE;
 static sig_atomic_t exitProgram = false;
 static int outfile_fd;
 
@@ -60,6 +66,8 @@ int  send_data(int fd);
 void cleanup(void);
 void *threadFunction(void *arg);
 void *timerFunction(void *arg);
+int remove_file_wrapper(const char *filename);
+int start_timer(void);
 
 int main(int argc, char **argv)
 {
@@ -133,16 +141,8 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    // Creating a thread to handle the connection
-    struct queue_t *timeElm = malloc(sizeof(struct queue_t));
-    memset(timeElm, 0, sizeof(struct queue_t));
-    timeElm->data.exit_thread = false;
+    start_timer(); 
 
-    pthread_create(&timeElm->data.thread_id, NULL, timerFunction, &timeElm->data);
-
-    pthread_mutex_lock(&threadMtx);
-    SLIST_INSERT_HEAD(&head, timeElm, entries);
-    pthread_mutex_unlock(&threadMtx);
     while (!exitProgram)
     {   
         // Accepting the connection
@@ -345,7 +345,7 @@ void cleanup(void)
     if (provider != NULL)
         freeaddrinfo(provider);
 
-    remove(socket_file);
+    remove_file_wrapper(socket_file);
     shutdown(sock_fd, SHUT_RDWR);
     close(sock_fd);
     close(outfile_fd);
@@ -353,3 +353,39 @@ void cleanup(void)
     pthread_mutex_destroy(&threadMtx);
     closelog();
 }
+
+// Platform specific functions
+#ifdef USE_AESD_CHAR_DEVICE && USE_AESD_CHAR_DEVICE
+
+    int remove_file_wrapper(const char *filename)
+    {
+        return 0;
+    }
+
+    int start_timer(void)
+    {
+        return 0;
+    }
+
+#else
+
+    int remove_file_wrapper(const char *filename)
+    {
+        return remove(filename);
+    }
+
+    int start_timer(void)
+    {
+        // Creating a thread to handle the connection
+        struct queue_t *timeElm = malloc(sizeof(struct queue_t));
+        memset(timeElm, 0, sizeof(struct queue_t));
+        timeElm->data.exit_thread = false;
+
+        pthread_create(&timeElm->data.thread_id, NULL, timerFunction, &timeElm->data);
+
+        pthread_mutex_lock(&threadMtx);
+        SLIST_INSERT_HEAD(&head, timeElm, entries);
+        pthread_mutex_unlock(&threadMtx);
+    }
+
+#endif // USE_AESD_CHAR_DEVICE && USE_AESD_CHAR_DEVICE
