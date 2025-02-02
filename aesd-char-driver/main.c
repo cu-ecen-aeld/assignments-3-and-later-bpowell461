@@ -24,6 +24,14 @@ int aesd_minor =   0;
 MODULE_AUTHOR("bpowell461"); /** TODO: fill in your name **/
 MODULE_LICENSE("Dual BSD/GPL");
 
+// Function Prototype Declarations
+int aesd_open(struct inode *inode, struct file *filp);
+int aesd_release(struct inode *inode, struct file *filp);
+ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
+ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+int aesd_init_module(void);
+void aesd_cleanup_module(void);
+
 struct aesd_dev aesd_device;
 
 int aesd_open(struct inode *inode, struct file *filp)
@@ -118,7 +126,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         sz = p + 1 - ad->working_entry.buffptr;
         entry.buffptr = ad->working_entry.buffptr;
         entry.size = sz;
-        kfree(aesd_circular_buffer_add_entry(&ad->cbuf, &entry));
+        aesd_circular_buffer_add_entry(&ad->cbuf, &entry);
         if (ad->working_entry.size == sz) {
             ad->working_entry.buffptr = NULL;
             ad->working_entry.size = 0;
