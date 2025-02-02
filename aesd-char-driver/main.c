@@ -150,49 +150,41 @@ exit:
 loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
 {
     loff_t ret_value;
-    int total_length = 0;
     struct aesd_dev *dev = filp->private_data;
-    
-    switch(whence)
-    {
+    size_t total_length = 0;
+    int i;
+
+    if (mutex_lock_interruptible(&dev->mutex)) {
+        return -ERESTARTSYS;
+    }
+
+    switch (whence) {
         case SEEK_SET:
-            ret_value = filp->f_pos;
+            ret_value = offset;
             break;
         case SEEK_CUR:
-            ret_value = filp->f_pos +offset;
+            ret_value = filp->f_pos + offset;
             break;
         case SEEK_END:
-            ret_value = mutex_lock_interruptible(&dev->buffer_lock);
-            if(ret_value !=0)
-            {
-                ret_value = -ERESTART;
-                PDEBUG("Error: Unable to do mutex lock");
-                goto exit;
+            for (i = dev->cbuf.out_offs; i != dev->cbuf.in_offs; i = (i + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+                total_length += dev->cbuf.entry[i].size;
             }
-            for(int i= dev->buffer.out_offs; i!=dev->buffer.in_offs;)
-            {
-                total_length += dev->buffer.entry[i].size;
-                i = (i+1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
-            }
-            mutex_unlock(&dev->buffer_lock);
-            ret_value = total_length-1+offset;
+            ret_value = total_length + offset;
             break;
         default:
             ret_value = -EINVAL;
-            break;              
+            goto exit;
     }
 
-    if(ret_value < 0 )
-    {
+    if (ret_value < 0 || ret_value > total_length) {
         ret_value = -EINVAL;
         goto exit;
     }
 
-   
     filp->f_pos = ret_value;
-    PDEBUG("File position seeked to %d",filp->f_pos);
 
 exit:
+    mutex_unlock(&dev->mutex);
     return ret_value;
 }
 
@@ -201,33 +193,32 @@ long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     struct aesd_dev *ad = filp->private_data;
     struct aesd_seekto seekto;
     loff_t offset = 0;
-
-    PDEBUG("ioctl cmd=%u", cmd);
+    size_t entry_offset_byte_rtn;
+    struct aesd_buffer_entry *entry;
 
     if (cmd != AESDCHAR_IOCSEEKTO) {
         return -ENOTTY;
     }
 
-    if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto))!=0) {
+    if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto)) != 0) {
         return -EFAULT;
     }
-
-    PDEBUG("ioctl: seekto=%d, %d", seekto.write_cmd, seekto.write_cmd_offset);
 
     if (mutex_lock_interruptible(&ad->mutex)) {
         return -ERESTARTSYS;
     }
 
-    offset = (off_t) aesd_circular_buffer_get_offset(&ad->cbuf, seekto.write_cmd, seekto.write_cmd_offset);
-    if (offset < 0) {
-        offset = -EINVAL;
-        goto exit;
+    entry = aesd_circular_buffer_find_entry_offset_for_fpos(&ad->cbuf, seekto.write_cmd, &entry_offset_byte_rtn);
+    if (!entry || seekto.write_cmd_offset >= entry->size) {
+        mutex_unlock(&ad->mutex);
+        return -EINVAL;
     }
 
+    offset = entry_offset_byte_rtn + seekto.write_cmd_offset;
     filp->f_pos = offset;
-exit:
+
     mutex_unlock(&ad->mutex);
-    return offset;
+    return 0;
 }
 struct file_operations aesd_fops = {
     .owner =          THIS_MODULE,

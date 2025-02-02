@@ -21,7 +21,8 @@
 #include <sys/queue.h>
 #include <pthread.h>
 #include <time.h>
-
+#include <sys/ioctl.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #ifdef USE_AESD_CHAR_DEVICE && USE_AESD_CHAR_DEVICE
 #define SOCKET_FILE "/dev/aesdchar"
@@ -73,6 +74,7 @@ void *threadFunction(void *arg);
 void *timerFunction(void *arg);
 int remove_file_wrapper(const char *filename);
 int start_timer(void);
+int handle_special_command(int fd, const char *buf);
 
 int main(int argc, char **argv)
 {
@@ -249,6 +251,8 @@ int receive_data(int fd)
     {
         total_bytes += recv_bytes;
         buf[total_bytes] = '\0';
+        if (handle_special_command(fd, buf) == 0)
+            continue;
         if (strchr(buf, '\n') != NULL)
             break;
     }
@@ -395,3 +399,19 @@ void cleanup(void)
     }
 
 #endif // USE_AESD_CHAR_DEVICE && USE_AESD_CHAR_DEVICE
+
+int handle_special_command(int fd, const char *buf)
+{
+    if (strncmp(buf, "AESDCHAR_IOCSEEKTO:", 19) == 0) {
+        unsigned int x, y;
+        if (sscanf(buf + 19, "%u,%u", &x, &y) == 2) {
+            struct aesd_seekto seekto = { .write_cmd = x, .write_cmd_offset = y };
+            if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == -1) {
+                syslog(LOG_ERR, "ioctl failed: %s\n", strerror(errno));
+                return -1;
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
