@@ -18,6 +18,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
 
@@ -145,12 +146,97 @@ exit:
     mutex_unlock(&ad->mutex);
     return retval;
 }
+
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    loff_t ret_value;
+    int total_length = 0;
+    struct aesd_dev *dev = filp->private_data;
+    
+    switch(whence)
+    {
+        case SEEK_SET:
+            ret_value = filp->f_pos;
+            break;
+        case SEEK_CUR:
+            ret_value = filp->f_pos +offset;
+            break;
+        case SEEK_END:
+            ret_value = mutex_lock_interruptible(&dev->buffer_lock);
+            if(ret_value !=0)
+            {
+                ret_value = -ERESTART;
+                PDEBUG("Error: Unable to do mutex lock");
+                goto exit;
+            }
+            for(int i= dev->buffer.out_offs; i!=dev->buffer.in_offs;)
+            {
+                total_length += dev->buffer.entry[i].size;
+                i = (i+1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+            }
+            mutex_unlock(&dev->buffer_lock);
+            ret_value = total_length-1+offset;
+            break;
+        default:
+            ret_value = -EINVAL;
+            break;              
+    }
+
+    if(ret_value < 0 )
+    {
+        ret_value = -EINVAL;
+        goto exit;
+    }
+
+   
+    filp->f_pos = ret_value;
+    PDEBUG("File position seeked to %d",filp->f_pos);
+
+exit:
+    return ret_value;
+}
+
+long aesd_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    struct aesd_dev *ad = filp->private_data;
+    struct aesd_seekto seekto;
+    loff_t offset = 0;
+
+    PDEBUG("ioctl cmd=%u", cmd);
+
+    if (cmd != AESDCHAR_IOCSEEKTO) {
+        return -ENOTTY;
+    }
+
+    if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto))!=0) {
+        return -EFAULT;
+    }
+
+    PDEBUG("ioctl: seekto=%d, %d", seekto.write_cmd, seekto.write_cmd_offset);
+
+    if (mutex_lock_interruptible(&ad->mutex)) {
+        return -ERESTARTSYS;
+    }
+
+    offset = (off_t) aesd_circular_buffer_get_offset(&ad->cbuf, seekto.write_cmd, seekto.write_cmd_offset);
+    if (offset < 0) {
+        offset = -EINVAL;
+        goto exit;
+    }
+
+    filp->f_pos = offset;
+exit:
+    mutex_unlock(&ad->mutex);
+    return offset;
+}
 struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
+    .owner =          THIS_MODULE,
+    .read =           aesd_read,
+    .write =          aesd_write,
+    .open =           aesd_open,
+    .release =        aesd_release,
+    .llseek =         aesd_llseek,
+    .unlocked_ioctl = aesd_unlocked_ioctl
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)

@@ -1,11 +1,15 @@
 #define _XOPEN_SOURCE 700
-#include <sys/socket.h>
+
+#ifndef WIN32
+    #include <sys/socket.h>
+    #include <netdb.h>
+    #include <syslog.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+#endif
+
 #include <sys/types.h>
-#include <netdb.h>
-#include <syslog.h>
 #include <string.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <stdio.h>
@@ -17,6 +21,7 @@
 #include <sys/queue.h>
 #include <pthread.h>
 #include <time.h>
+
 
 #ifdef USE_AESD_CHAR_DEVICE && USE_AESD_CHAR_DEVICE
 #define SOCKET_FILE "/dev/aesdchar"
@@ -247,6 +252,7 @@ int receive_data(int fd)
         if (strchr(buf, '\n') != NULL)
             break;
     }
+
     pthread_mutex_lock(&fileMtx);
     write(outfile_fd, buf, total_bytes);
     fdatasync(outfile_fd);
