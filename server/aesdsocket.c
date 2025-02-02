@@ -24,6 +24,8 @@
 #include <sys/ioctl.h>
 #include "../aesd-char-driver/aesd_ioctl.h"
 
+#define USE_AESD_CHAR_DEVICE 1
+
 #ifdef USE_AESD_CHAR_DEVICE && USE_AESD_CHAR_DEVICE
 #define SOCKET_FILE "/dev/aesdchar"
 #else
@@ -86,6 +88,7 @@ int main(int argc, char **argv)
     // Setting up the syslog
     openlog(NULL,0,LOG_USER);
     syslog(LOG_INFO, "Starting socket server\n");
+    remove(socket_file);
 
     SLIST_INIT(&head);
 
